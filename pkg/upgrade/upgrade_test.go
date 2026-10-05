@@ -17,6 +17,8 @@ package upgrade
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"regexp"
 	"strings"
 	"testing"
@@ -29,6 +31,14 @@ const urlReleasesCN = "https://image.cnxct.com"
 const apiReleases string = "/ecapture/releases/latest"
 
 func TestCheckLatest(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("User-Agent") == "" || r.Header.Get("Accept") != "application/json" {
+			t.Error("missing API request headers")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"tag_name":"v0.9.2","assets":[{"name":"ecapture-v0.9.2-linux-amd64.tar.gz","browser_download_url":"https://example.invalid/amd64"},{"name":"ecapture-v0.9.2-linux-arm64.tar.gz","browser_download_url":"https://example.invalid/arm64"}]}`)
+	}))
+	defer server.Close()
 	var uname unix.Utsname
 
 	// 调用 uname 系统调用
@@ -66,7 +76,7 @@ func TestCheckLatest(t *testing.T) {
 		os = "android"
 	}
 
-	githubResp, err := GetLatestVersion(useragent, fmt.Sprintf("%s%s?ver=%s", urlReleases, apiReleases, ver), context.Background())
+	githubResp, err := GetLatestVersion(useragent, fmt.Sprintf("%s%s?ver=%s", server.URL, apiReleases, ver), context.Background())
 	if err != nil {
 		t.Fatalf("Error getting latest version: %s", err.Error())
 	}
@@ -77,6 +87,9 @@ func TestCheckLatest(t *testing.T) {
 		t.Fatalf("Error checking version: %s", err.Error())
 	}
 	t.Logf("Version comparison: %v", comp)
+	if comp != -1 {
+		t.Fatalf("version comparison = %d, want -1", comp)
+	}
 
 	if comp >= 0 {
 		t.Logf("Local version is ahead of latest version")

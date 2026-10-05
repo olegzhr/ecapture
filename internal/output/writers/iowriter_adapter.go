@@ -15,6 +15,7 @@
 package writers
 
 import (
+	pb "github.com/gojue/ecapture/v2/protobuf/gen/v1"
 	"io"
 )
 
@@ -35,6 +36,14 @@ func NewIOWriterAdapter(w io.Writer, name string) *IOWriterAdapter {
 // Write writes data to the underlying writer.
 func (a *IOWriterAdapter) Write(p []byte) (n int, err error) {
 	return a.writer.Write(p)
+}
+
+// Forward structured captures when the destination supports metadata.
+func (a *IOWriterAdapter) WriteProtobufEvent(event *pb.Event) (bool, error) {
+	if writer, ok := a.writer.(interface{ WriteProtobufEvent(*pb.Event) (bool, error) }); ok {
+		return writer.WriteProtobufEvent(event)
+	}
+	return false, nil
 }
 
 // Close closes the underlying writer if it implements io.Closer.

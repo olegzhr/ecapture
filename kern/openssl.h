@@ -25,6 +25,18 @@ enum ssl_data_event_type { kSSLRead, kSSLWrite };
 #define INVALID_FD 0
 #define DEFAULT_BIO_TYPE 0
 
+// Captured at SSL entry, so plaintext and endpoints share one socket snapshot.
+// Byte arrays avoid 128-bit alignment padding in the perf-event ABI.
+struct tls_endpoint_t {
+    u8 saddr[16];
+    u8 daddr[16];
+    u64 sock;
+    u16 family;
+    u16 sport;
+    u16 dport;
+    u16 pad;
+};
+
 struct ssl_data_event_t {
     enum ssl_data_event_type type;
     u64 timestamp_ns;
@@ -36,6 +48,7 @@ struct ssl_data_event_t {
     u32 fd;
     s32 version;
     u32 bio_type;
+    struct tls_endpoint_t endpoint;
 };
 
 struct connect_event_t {
@@ -64,6 +77,7 @@ struct active_ssl_buf {
     u32 fd;
     u32 bio_type;
     const char* buf;
+    struct tls_endpoint_t endpoint;
 };
 
 struct tcp_fd_info {
@@ -162,7 +176,8 @@ static __always_inline struct ssl_data_event_t* create_ssl_data_event(
 
 static int process_SSL_data(struct pt_regs* ctx, u64 id,
                             enum ssl_data_event_type type, const char* buf,
-                            u32 fd, s32 version, u32 bio_type) {
+                            u32 fd, s32 version, u32 bio_type,
+                            const struct tls_endpoint_t *endpoint) {
     int len = (int)PT_REGS_RC(ctx);
     if (len < 0) {
         return 0;
@@ -177,6 +192,7 @@ static int process_SSL_data(struct pt_regs* ctx, u64 id,
     event->fd = fd;
     event->bio_type = bio_type;
     event->version = version;
+    __builtin_memcpy(&event->endpoint, endpoint, sizeof(event->endpoint));
     // This is a max function, but it is written in such a way to keep older BPF
     // verifiers happy.
     event->data_len =
@@ -268,6 +284,54 @@ static int process_SSL_bio(void *ssl, int bio_offset, u32 *fd, u32 *bio_type) {
     return 0;
 }
 
+static __always_inline void snapshot_tls_endpoint(u32 fd, struct tls_endpoint_t *out) {
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    struct files_struct *files = NULL;
+    struct fdtable *fdt = NULL;
+    struct file **fds = NULL;
+    struct file *file = NULL;
+    struct inode *inode = NULL;
+    struct socket *socket = NULL;
+    struct sock *sk = NULL;
+    u32 max_fds = 0;
+    u16 mode = 0;
+    if (fd >= 65536 || bpf_probe_read_kernel(&files, sizeof(files), &task->files) || !files)
+        return;
+    if (bpf_probe_read_kernel(&fdt, sizeof(fdt), &files->fdt) || !fdt)
+        return;
+    if (bpf_probe_read_kernel(&max_fds, sizeof(max_fds), &fdt->max_fds) || fd >= max_fds)
+        return;
+    if (bpf_probe_read_kernel(&fds, sizeof(fds), &fdt->fd) || !fds ||
+        bpf_probe_read_kernel(&file, sizeof(file), &fds[fd]) || !file)
+        return;
+    if (bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode) || !inode ||
+        bpf_probe_read_kernel(&mode, sizeof(mode), &inode->i_mode) || (mode & 0170000) != 0140000)
+        return;
+    if (bpf_probe_read_kernel(&socket, sizeof(socket), &file->private_data) || !socket ||
+        bpf_probe_read_kernel(&sk, sizeof(sk), &socket->sk) || !sk)
+        return;
+    u16 family = 0, sport = 0, dport = 0;
+    if (bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family) ||
+        bpf_probe_read_kernel(&sport, sizeof(sport), &sk->__sk_common.skc_num) ||
+        bpf_probe_read_kernel(&dport, sizeof(dport), &sk->__sk_common.skc_dport))
+        return;
+    if (family == AF_INET) {
+        if (bpf_probe_read_kernel(out->saddr, 4, &sk->__sk_common.skc_rcv_saddr) ||
+            bpf_probe_read_kernel(out->daddr, 4, &sk->__sk_common.skc_daddr))
+            return;
+    } else if (family == AF_INET6) {
+        if (bpf_probe_read_kernel(out->saddr, 16, &sk->__sk_common.skc_v6_rcv_saddr) ||
+            bpf_probe_read_kernel(out->daddr, 16, &sk->__sk_common.skc_v6_daddr))
+            return;
+    } else {
+        return;
+    }
+    out->sock = (u64)sk;
+    out->family = family;
+    out->sport = sport;
+    out->dport = bpf_ntohs(dport);
+}
+
 static __always_inline int probe_entry_SSL(struct pt_regs* ctx, void *map, int bio_offset) {
     if (!passes_filter(ctx)) {
         return 0;
@@ -300,6 +364,7 @@ static __always_inline int probe_entry_SSL(struct pt_regs* ctx, void *map, int b
     active_ssl_buf_t.version = ssl_version;
     active_ssl_buf_t.buf = buf;
     active_ssl_buf_t.bio_type = bio_type;
+    snapshot_tls_endpoint(fd, &active_ssl_buf_t.endpoint);
     u64 current_pid_tgid = bpf_get_current_pid_tgid();
     bpf_map_update_elem(map, &current_pid_tgid, &active_ssl_buf_t, BPF_ANY);
     return 0;
@@ -318,7 +383,8 @@ static __always_inline int probe_ret_SSL(struct pt_regs* ctx, void *map, enum ss
         u32 bio_type = active_ssl_buf_t->bio_type;
         s32 version = active_ssl_buf_t->version;
         bpf_probe_read(&buf, sizeof(const char*), &active_ssl_buf_t->buf);
-        process_SSL_data(ctx, current_pid_tgid, type, buf, fd, version, bio_type);
+        process_SSL_data(ctx, current_pid_tgid, type, buf, fd, version, bio_type,
+                         &active_ssl_buf_t->endpoint);
     }
     bpf_map_delete_elem(map, &current_pid_tgid);
     return 0;

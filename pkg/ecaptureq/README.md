@@ -1,5 +1,8 @@
 ## eCapture WebSocket API 文档
 
+Delivery limits, overload policy, endpoint binding and local TLS regression tests
+are documented in [eCaptureQ reliability](../../docs/ecaptureq-reliability.md).
+
 适用于 eCapture 的 WebSocket 接口，允许客户端连接到 eCapture 服务端以接收实时事件和日志。
 
 ### 连接方式

@@ -24,7 +24,7 @@ func readKernelSource(t *testing.T, name string) string {
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
 	}
-	return string(contents)
+	return strings.ReplaceAll(string(contents), "\r\n", "\n")
 }
 
 func TestOpenSSLTaggedPointerMask(t *testing.T) {

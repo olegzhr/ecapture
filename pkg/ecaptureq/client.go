@@ -16,120 +16,85 @@ package ecaptureq
 
 import (
 	"fmt"
-	"io"
-	"time"
-
 	pb "github.com/gojue/ecapture/v2/protobuf/gen/v1"
-
 	"golang.org/x/net/websocket"
 	"google.golang.org/protobuf/proto"
+	"time"
 )
 
-var (
-	newline = []byte{'\n'}
-	space   = []byte{' '}
-)
+const socketWriteTimeout = 5 * time.Second
 
-// Client is a middleman between the websocket connection and the hub.
 type Client struct {
-	hub *Hub
-
-	// The websocket connection.
-	conn *websocket.Conn
-
-	// Buffered channel of outbound messages.
-	send chan []byte
-
-	logger io.Writer
-
+	hub            *Hub
+	conn           *websocket.Conn
+	send           chan []byte
+	done           chan struct{}
+	queuedBytes    int // protected by hub.mu
 	heartBeatCount int
-
-	hbTimer *time.Ticker
 }
 
-// readPump pumps messages from the websocket connection to the hub.
-//
-// The application runs readPump in a per-connection goroutine. The application
-// ensures that there is at most one reader on a connection by executing all
-// reads from this goroutine.
 func (c *Client) readPump() {
-	defer func() {
-		c.hub.unregister <- c
-		_ = c.conn.Close()
-	}()
-	_, _ = c.logger.Write([]byte("readPump: starting to read messages from WebSocket connection\n"))
+	defer c.hub.removeClient(c)
+	defer c.conn.Close()
+	c.conn.MaxPayloadBytes = maxMessageBytes
 	for {
 		var data []byte
-		// 检查连接状态
-		if c.conn == nil {
-			_, _ = c.logger.Write([]byte("readPump: WebSocket connection is nil\n"))
-			break
+		if websocket.Message.Receive(c.conn, &data) != nil {
+			return
 		}
-		err := websocket.Message.Receive(c.conn, &data)
-		if err != nil {
-			_, _ = c.logger.Write([]byte("readPump: error receiving message\n"))
-			break
-		}
-		//_, _ = c.logger.Write([]byte(fmt.Sprintf("Client:%s:%s, readPump: %s\n", c.conn.LocalAddr().String(), c.conn.RemoteAddr().String(), string(data))))
 	}
 }
 
-// writePump pumps messages from the hub to the websocket connection.
-//
-// A goroutine running writePump is started for each connection. The
-// application ensures that there is at most one writer to a connection by
-// executing all writes from this goroutine.
+// The sole socket writer also sends heartbeats, without enqueueing to itself.
 func (c *Client) writePump() {
-	c.hbTimer = time.NewTicker(15 * time.Second)
-	defer func() {
-		c.hbTimer.Stop()
-		_ = c.conn.Close()
-	}()
-
-	// heartbeat when client connected
-	err := c.Heartbeat()
-	if err != nil {
-		_, _ = c.logger.Write([]byte(fmt.Sprintf("writePump: error sending heartbeat: %v\n", err)))
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	defer c.hub.removeClient(c)
+	defer c.conn.Close()
+	if c.Heartbeat() != nil {
+		c.hub.writeError()
+		return
 	}
-
 	for {
 		select {
+		case <-c.done:
+			return
 		case message, ok := <-c.send:
 			if !ok {
-				// The hub closed the channel.
-				_, _ = c.logger.Write([]byte("writePump: sender channel closed\n"))
 				return
 			}
-			err := websocket.Message.Send(c.conn, message)
-			if err != nil {
-				_, _ = c.logger.Write([]byte("writePump: error sending message\n"))
+			c.hub.consumed(c, message)
+			if c.write(message) != nil {
+				c.hub.writeError()
 				return
 			}
-			//_, _ = c.logger.Write([]byte(fmt.Sprintf("Client:%s:%s, writePump: %s\n", c.conn.LocalAddr().String(), c.conn.RemoteAddr().String(), string(bytes.TrimSpace(message)))))
-		case <-c.hbTimer.C:
-			err := c.Heartbeat()
-			if err != nil {
-				_, _ = c.logger.Write([]byte(fmt.Sprintf("writePump: error sending heartbeat: %v\n", err)))
+		case <-ticker.C:
+			if c.Heartbeat() != nil {
+				c.hub.writeError()
+				return
 			}
 		}
-
 	}
 }
 
-func (c *Client) Heartbeat() error {
-	hb := new(pb.Heartbeat)
-	hb.Message = fmt.Sprintf("heartbeat:%d", c.heartBeatCount)
-	hb.Timestamp = time.Now().Unix()
-	hb.Count = int64(c.heartBeatCount)
+func (c *Client) write(data []byte) error {
+	if err := c.conn.SetWriteDeadline(time.Now().Add(socketWriteTimeout)); err != nil {
+		return err
+	}
+	return websocket.Message.Send(c.conn, data)
+}
 
-	le := new(pb.LogEntry)
-	le.LogType = pb.LogType_LOG_TYPE_HEARTBEAT
-	le.Payload = &pb.LogEntry_HeartbeatPayload{HeartbeatPayload: hb}
-	encodedData, err := proto.Marshal(le)
+// Heartbeat is called only by writePump.
+func (c *Client) Heartbeat() error {
+	hb := &pb.Heartbeat{Message: fmt.Sprintf("heartbeat:%d", c.heartBeatCount),
+		Timestamp: time.Now().Unix(), Count: int64(c.heartBeatCount)}
+	encoded, err := proto.Marshal(&pb.LogEntry{LogType: pb.LogType_LOG_TYPE_HEARTBEAT,
+		Payload: &pb.LogEntry_HeartbeatPayload{HeartbeatPayload: hb}})
 	if err != nil {
 		return err
 	}
-	c.send <- encodedData
-	c.heartBeatCount++
+	if err = c.write(encoded); err == nil {
+		c.heartBeatCount++
+	}
 	return err
 }

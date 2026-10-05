@@ -15,114 +15,159 @@
 package ecaptureq
 
 import (
-	"context"
-	"fmt"
-	"io"
-
+	"github.com/gojue/ecapture/v2/internal/logger"
 	"github.com/gojue/ecapture/v2/pkg/util/ws"
 	pb "github.com/gojue/ecapture/v2/protobuf/gen/v1"
-
 	"golang.org/x/net/websocket"
 	"google.golang.org/protobuf/proto"
+	"io"
+	"sync"
+	"time"
 )
 
 const LogBuffLen = 128
+const logBuffBytes = 1 << 20
 
 type Server struct {
-	addr    string
-	logbuff [][]byte
-	handler func([]byte)
-	hub     *Hub
-	ws      *ws.Server
-	logger  io.Writer
-	ctx     context.Context
+	hub         *Hub
+	ws          *ws.Server
+	mu          sync.Mutex // protects history and makes registration atomic with logs
+	logbuff     [][]byte
+	logBytes    int
+	closed      bool
+	logger      *logger.Logger
+	lastWarning time.Time
+	clients     sync.WaitGroup
+	closeOnce   sync.Once
 }
 
-// NewServer 创建一个新的服务器实例
 func NewServer(addr string, logWriter io.Writer) *Server {
-	s := &Server{
-		addr:    addr,
-		logbuff: make([][]byte, 0, LogBuffLen),
-		logger:  logWriter,
-		hub:     newHub(),
-		ctx:     context.Background(),
-	}
-	server := ws.NewServer(s.addr, s.handleWebSocket)
-	s.ws = server
-	go func() {
-		s.hub.run()
-	}()
-
+	s := &Server{hub: newHub(), logger: logger.New(logWriter, false)}
+	s.hub.onLoss = s.warnLoss
+	s.ws = ws.NewServer(addr, s.handleWebSocket)
+	go s.hub.run()
 	return s
 }
 
-// Start 启动服务器
-func (s *Server) Start() error {
-	err := s.ws.Start()
-	return err
-}
+func (s *Server) Start() error { return s.ws.Start() }
+func (s *Server) Stats() Stats { return s.hub.snapshot() }
 
 func (s *Server) handleWebSocket(conn *websocket.Conn) {
-	_, _ = s.logger.Write([]byte(fmt.Sprintf("New WebSocket connection from %s", conn.RemoteAddr())))
-	defer func() {
-		_, _ = s.logger.Write([]byte(fmt.Sprintf("Closing WebSocket connection from %s", conn.RemoteAddr())))
-	}()
-
-	client := &Client{hub: s.hub, conn: conn, send: make(chan []byte, 256), logger: s.logger}
-	client.hub.register <- client
-
-	// 为新连接的客户端发送预存储的日志数据
-	s.sendLogBuff(client)
-
-	// Allow collection of memory referenced by the caller by doing all work in
-	// new goroutines.
-	go client.writePump()
-	go client.readPump()
-	<-s.ctx.Done()
+	c := &Client{hub: s.hub, conn: conn, send: make(chan []byte, clientQueueMessages), done: make(chan struct{})}
+	s.mu.Lock()
+	if s.closed || !s.hub.addClient(c, s.logbuff) {
+		s.mu.Unlock()
+		conn.Close()
+		return
+	}
+	s.clients.Add(1)
+	s.mu.Unlock()
+	defer s.clients.Done()
+	defer conn.Close()
+	finished := make(chan struct{})
+	go func() { <-c.done; conn.Close() }()
+	go func() { c.writePump(); close(finished) }()
+	c.readPump()
+	<-finished
 }
 
-func (s *Server) sendLogBuff(c *Client) {
-	for _, log := range s.logbuff {
-		c.send <- log
+func (s *Server) warnLoss(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if time.Since(s.lastWarning) < time.Second {
+		return
 	}
+	s.lastWarning = time.Now()
+	s.logger.Warn().Err(err).Interface("transport_stats", s.Stats()).Msg("ecaptureQ delivery rejected")
 }
 
-// WriteLog writes data to the WebSocket server.
-func (s *Server) WriteLog(data []byte) (n int, e error) {
-	le := new(pb.LogEntry)
-	le.LogType = pb.LogType_LOG_TYPE_PROCESS_LOG
-	le.Payload = &pb.LogEntry_RunLog{RunLog: string(data)}
-	encodedData, err := proto.Marshal(le)
-	// 如果程序初始化的日志缓冲区已满，则不再添加新的日志
-	if len(s.logbuff) <= LogBuffLen {
-		if err == nil {
-			s.logbuff = append(s.logbuff, encodedData)
-		}
-		return len(data), nil
-	}
-	s.hub.broadcastMessage(encodedData)
-	return len(data), nil
-}
-
-// WriteEvent writes an event to the WebSocket server.
-func (s *Server) WriteEvent(data []byte) (n int, e error) {
-	le := &pb.LogEntry{
-		LogType: pb.LogType_LOG_TYPE_EVENT,
-		Payload: &pb.LogEntry_EventPayload{
-			EventPayload: &pb.Event{
-				Payload: data,
-				Length:  uint32(len(data)),
-			},
-		},
-	}
-	encodedData, err := proto.Marshal(le)
+// Cache a bounded history window, while broadcasting every log immediately.
+func (s *Server) WriteLog(data []byte) (int, error) {
+	encoded, err := proto.Marshal(&pb.LogEntry{LogType: pb.LogType_LOG_TYPE_PROCESS_LOG,
+		Payload: &pb.LogEntry_RunLog{RunLog: string(data)}})
 	if err != nil {
 		return 0, err
 	}
-	s.hub.broadcastMessage(encodedData)
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return 0, transportError("server closed")
+	}
+	if len(encoded) > logBuffBytes {
+		s.mu.Unlock()
+		return 0, transportError("log exceeds history budget")
+	}
+	for len(s.logbuff) >= LogBuffLen || s.logBytes+len(encoded) > logBuffBytes {
+		s.logBytes -= len(s.logbuff[0])
+		s.logbuff[0] = nil
+		s.logbuff = s.logbuff[1:]
+	}
+	s.logbuff = append(s.logbuff, encoded)
+	s.logBytes += len(encoded)
+	if s.Stats().Clients != 0 {
+		err = s.hub.broadcastMessage(encoded)
+	}
+	s.mu.Unlock()
+	if err != nil {
+		s.warnLoss(err)
+		return 0, err
+	}
 	return len(data), nil
 }
 
+func (s *Server) WriteEvent(data []byte) (int, error) {
+	if len(data) > maxMessageBytes-64 {
+		s.hub.mu.Lock()
+		s.hub.stats.Oversized++
+		s.hub.mu.Unlock()
+		err := transportError("event exceeds message budget")
+		s.warnLoss(err)
+		return 0, err
+	}
+	encoded, err := proto.Marshal(&pb.LogEntry{LogType: pb.LogType_LOG_TYPE_EVENT,
+		Payload: &pb.LogEntry_EventPayload{EventPayload: &pb.Event{Payload: data, Length: uint32(len(data))}}})
+	if err == nil {
+		err = s.hub.broadcastMessage(encoded)
+	}
+	if err != nil {
+		s.warnLoss(err)
+		return 0, err
+	}
+	return len(data), nil
+}
+
+// WriteProtobufEvent preserves sensor-supplied endpoints alongside plaintext.
+func (s *Server) WriteProtobufEvent(event *pb.Event) error {
+	if event == nil || len(event.Payload) > maxMessageBytes-1024 {
+		return transportError("invalid structured event or message exceeds budget")
+	}
+	if event.SrcIp == "" || event.DstIp == "" || event.SrcPort == 0 || event.DstPort == 0 {
+		s.hub.mu.Lock()
+		s.hub.stats.MissingEndpoints++
+		s.hub.mu.Unlock()
+		err := transportError("TLS socket snapshot unavailable; refusing stale endpoint fallback")
+		s.warnLoss(err)
+		return err
+	}
+	encoded, err := proto.Marshal(&pb.LogEntry{LogType: pb.LogType_LOG_TYPE_EVENT,
+		Payload: &pb.LogEntry_EventPayload{EventPayload: event}})
+	if err == nil {
+		err = s.hub.broadcastMessage(encoded)
+	}
+	if err != nil {
+		s.warnLoss(err)
+	}
+	return err
+}
+
 func (s *Server) Close() {
-	s.ctx.Done()
+	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.closed = true
+		s.mu.Unlock()
+		s.hub.close()
+		s.ws.Close()
+		s.clients.Wait()
+		s.logger.Info().Interface("transport_stats", s.Stats()).Msg("ecaptureQ stopped")
+	})
 }
