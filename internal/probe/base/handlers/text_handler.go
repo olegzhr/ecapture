@@ -18,6 +18,7 @@ import (
 	"github.com/gojue/ecapture/v2/internal/domain"
 	"github.com/gojue/ecapture/v2/internal/errors"
 	"github.com/gojue/ecapture/v2/internal/output/writers"
+	pb "github.com/gojue/ecapture/v2/protobuf/gen/v1"
 )
 
 // TextHandler handles events by writing their encoded output to a destination.
@@ -79,6 +80,26 @@ func (h *TextHandler) Handle(event domain.Event) error {
 	}
 
 	// Write to output destination
+	if source, ok := event.(interface{ ToProtobufEvent() *pb.Event }); ok {
+		if writer, ok := h.writer.(interface{ WriteProtobufEvent(*pb.Event) (bool, error) }); ok {
+			// Structured TLS captures carry their own endpoints. Standalone lifecycle
+			// records can arrive late and overwrite a reused-FD collector cache.
+			if event.Type() == domain.EventTypeModuleData {
+				if handled, err := writer.WriteProtobufEvent(nil); handled {
+					return err
+				}
+			}
+			structured := source.ToProtobufEvent()
+			structured.Payload = []byte(output)
+			structured.Length = uint32(len(structured.Payload))
+			if handled, err := writer.WriteProtobufEvent(structured); handled {
+				if err != nil {
+					return errors.Wrap(errors.ErrCodeEventDispatch, "failed to write structured event", err)
+				}
+				return nil
+			}
+		}
+	}
 	_, err := h.writer.Write([]byte(output))
 	if err != nil {
 		return errors.Wrap(errors.ErrCodeEventDispatch, "failed to write event output", err)

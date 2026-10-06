@@ -16,6 +16,7 @@ package mysql
 
 import (
 	"context"
+	"os"
 	"testing"
 
 	icfg "github.com/gojue/ecapture/v2/internal/config"
@@ -66,6 +67,12 @@ func TestDispatchCommandReturn_String(t *testing.T) {
 }
 
 func TestConfig_Validate(t *testing.T) {
+	// These cases validate explicit symbol/offset configuration and file
+	// existence; they do not attach to mysqld or require a system installation.
+	binaryPath, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
 	tests := []struct {
 		name    string
 		config  *Config
@@ -83,19 +90,19 @@ func TestConfig_Validate(t *testing.T) {
 			name: "with function name",
 			config: &Config{
 				BaseConfig: NewConfig().BaseConfig,
-				MysqlPath:  "/usr/sbin/mysqld",
+				MysqlPath:  binaryPath,
 				FuncName:   "dispatch_command",
 			},
-			wantErr: false, // Will fail on non-existent file, but validation logic passes
+			wantErr: false,
 		},
 		{
 			name: "with offset",
 			config: &Config{
 				BaseConfig: NewConfig().BaseConfig,
-				MysqlPath:  "/usr/sbin/mysqld",
+				MysqlPath:  binaryPath,
 				Offset:     0x12345,
 			},
-			wantErr: false, // Will fail on non-existent file, but validation logic passes
+			wantErr: false,
 		},
 	}
 
@@ -234,13 +241,17 @@ func TestProbe_Creation(t *testing.T) {
 func TestProbe_Initialize(t *testing.T) {
 	probe := NewProbe()
 	config := NewConfig()
-	config.MysqlPath = "/usr/sbin/mysqld"
+	binaryPath, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.MysqlPath = binaryPath
 	config.FuncName = "dispatch_command"
 
 	ctx := context.Background()
 
-	// Initialize should succeed with function name provided (no file check during init)
-	err := probe.Initialize(ctx, config)
+	// Explicit function configuration requires an existing file, without attaching a probe.
+	err = probe.Initialize(ctx, config)
 	if err != nil {
 		t.Errorf("Initialize failed: %v", err)
 		return

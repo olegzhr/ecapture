@@ -16,6 +16,7 @@ package cmd
 
 import (
 	"github.com/gojue/ecapture/v2/pkg/ecaptureq"
+	pb "github.com/gojue/ecapture/v2/protobuf/gen/v1"
 )
 
 // ecaptureQLogWriter
@@ -33,4 +34,11 @@ type ecaptureQEventWriter struct {
 
 func (eew *ecaptureQEventWriter) Write(data []byte) (n int, e error) {
 	return eew.es.WriteEvent(data)
+}
+
+func (eew *ecaptureQEventWriter) WriteProtobufEvent(event *pb.Event) (bool, error) {
+	if event == nil {
+		return true, nil
+	}
+	return true, eew.es.WriteProtobufEvent(event)
 }

@@ -15,8 +15,9 @@
 package ws
 
 import (
-	"fmt"
+	"github.com/gojue/ecapture/v2/internal/errors"
 	"net/http"
+	"sync"
 
 	"golang.org/x/net/websocket"
 )
@@ -25,6 +26,9 @@ import (
 type Server struct {
 	addr            string
 	handleWebSocket func(*websocket.Conn)
+	mu              sync.Mutex
+	server          *http.Server
+	closed          bool
 }
 
 // NewServer 创建一个新的WebSocket服务器实例
@@ -37,10 +41,33 @@ func NewServer(addr string, handler func(conn *websocket.Conn)) *Server {
 
 func (s *Server) Start() error {
 	if s.handleWebSocket == nil {
-		return fmt.Errorf("handleWebSocket function is not set")
+		return errors.New(errors.ErrCodeConfiguration, "handleWebSocket function is not set")
 	}
 
 	mux := http.NewServeMux()
 	mux.Handle("/", websocket.Handler(s.handleWebSocket))
-	return http.ListenAndServe(s.addr, mux)
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	s.server = &http.Server{Addr: s.addr, Handler: mux}
+	server := s.server
+	s.mu.Unlock()
+	err := server.ListenAndServe()
+	if err == http.ErrServerClosed {
+		return nil
+	}
+	return err
+}
+
+// Close stops accepting new connections. The owner closes hijacked WebSockets.
+func (s *Server) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed = true
+	if s.server != nil {
+		return s.server.Close()
+	}
+	return nil
 }

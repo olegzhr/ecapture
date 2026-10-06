@@ -18,6 +18,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	pb "github.com/gojue/ecapture/v2/protobuf/gen/v1"
+	"net/netip"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -110,10 +112,21 @@ type Event struct {
 	Tuple     string
 	BioType   uint32
 	Sock      uint64
+	Endpoint  tlsEndpoint
+}
+
+// Optional 48-byte perf ABI extension, appended after the legacy TLS payload.
+type tlsEndpoint struct {
+	Saddr, Daddr              [16]byte
+	Sock                      uint64
+	Family, Sport, Dport, Pad uint16
 }
 
 // DecodeFromBytes deserializes the event from raw eBPF data.
 func (e *Event) DecodeFromBytes(data []byte) error {
+	e.Endpoint = tlsEndpoint{}
+	e.Sock = 0
+	e.Tuple = ""
 	buf := bytes.NewBuffer(data)
 	if err := binary.Read(buf, binary.LittleEndian, &e.DataType); err != nil {
 		return errors.NewEventDecodeError("openssl.DataType", err)
@@ -146,8 +159,44 @@ func (e *Event) DecodeFromBytes(data []byte) error {
 	if err := binary.Read(buf, binary.LittleEndian, &e.BioType); err != nil {
 		return errors.NewEventDecodeError("openssl.BioType", err)
 	}
+	if buf.Len() > 7 {
+		if err := binary.Read(buf, binary.LittleEndian, &e.Endpoint); err != nil {
+			return errors.NewEventDecodeError("openssl.Endpoint", err)
+		}
+		e.Sock = e.Endpoint.Sock
+	}
 
 	return nil
+}
+
+// ToProtobufEvent binds plaintext to the endpoint captured at SSL entry,
+// independently of delayed connect perf records or reused process descriptors.
+func (e *Event) ToProtobufEvent() *pb.Event {
+	event := &pb.Event{Pid: int64(e.Pid), Pname: e.GetComm(), Timestamp: int64(e.Timestamp),
+		Uuid: fmt.Sprintf("%d_%d_%s_%d", e.Pid, e.Tid, e.GetComm(), e.Fd), Type: uint32(e.DataType)}
+	ep := e.Endpoint
+	if ep.Sock == 0 || ep.Sport == 0 || ep.Dport == 0 {
+		return event
+	}
+	var src, dst netip.Addr
+	switch ep.Family {
+	case unix.AF_INET:
+		src = netip.AddrFrom4([4]byte(ep.Saddr[:4]))
+		dst = netip.AddrFrom4([4]byte(ep.Daddr[:4]))
+	case unix.AF_INET6:
+		src = netip.AddrFrom16(ep.Saddr)
+		dst = netip.AddrFrom16(ep.Daddr)
+	default:
+		return event
+	}
+	if src.IsUnspecified() || dst.IsUnspecified() {
+		return event
+	}
+	event.SrcIp = src.String()
+	event.DstIp = dst.String()
+	event.SrcPort = uint32(ep.Sport)
+	event.DstPort = uint32(ep.Dport)
+	return event
 }
 
 // PerfMonoNs implements domain.MonoNsEvent (ebpf timestamp_ns / bpf_ktime_get_ns).

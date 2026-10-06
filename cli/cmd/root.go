@@ -255,6 +255,7 @@ func runProbe(probeType factory.ProbeType, probeConfig domain.Configuration) err
 			return err
 		}
 		es := ecaptureq.NewServer(parsedURL.Host, os.Stdout)
+		defer es.Close()
 		go func() {
 			err := es.Start()
 			if err != nil {
